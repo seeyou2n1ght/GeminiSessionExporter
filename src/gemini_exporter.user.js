@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Session Exporter
 // @namespace    http://tampermonkey.net/
-// @version      0.4
+// @version      0.5
 // @description  Export Gemini chat history to Markdown/PDF/ZIP
 // @author       Antigravity
 // @match        https://gemini.google.com/*
@@ -42,6 +42,12 @@
         includeMetadata: true,
         delay: 2000
     };
+
+    // TurndownService singleton for HTML to Markdown conversion
+    const turndownService = new TurndownService({
+        headingStyle: 'atx',
+        codeBlockStyle: 'fenced'
+    });
 
     // --- Helper: Settings Management ---
     function getSettings() {
@@ -105,10 +111,6 @@
             } else {
                 const markdownContainer = msg.querySelector(SELECTORS.MODEL_CONTENT) || msg.querySelector('.message-content') || msg;
                 if (markdownContainer) {
-                    const turndownService = new TurndownService({
-                        headingStyle: 'atx',
-                        codeBlockStyle: 'fenced'
-                    });
                     text = turndownService.turndown(markdownContainer.innerHTML);
                 } else {
                     text = msg.innerText;
@@ -194,18 +196,23 @@
             return unique;
         },
 
-        async processQueue(updateStatus, updateProgress) {
+        async processQueue(updateStatus, updateProgress, totalCount) {
             const queue = GM_getValue(STATE_KEYS.QUEUE, []);
             let results = GM_getValue(STATE_KEYS.RESULTS, []);
             const settings = getSettings();
 
             if (queue.length === 0) {
-                this.finalizeExport(results, updateStatus);
+                this.finalizeExport(results, updateStatus, updateProgress);
                 return;
             }
 
+            // Calculate progress: processed = total - remaining
+            const processed = totalCount - queue.length;
+            const progressPercent = Math.round((processed / totalCount) * 90); // 0-90% for extraction, 90-100% for compression
+            if (updateProgress) updateProgress(progressPercent);
+
             const currentItem = queue[0];
-            updateStatus(`⏳ Processing: ${currentItem.title}`);
+            updateStatus(`⏳ [${processed + 1}/${totalCount}] ${currentItem.title}`);
 
             // Navigate if needed
             if (window.location.href !== currentItem.url) {
@@ -218,20 +225,29 @@
             }
 
             // Wait for content
-            await waitForElement(SELECTORS.CHAT_CONTAINER, 10000);
-            await new Promise(r => setTimeout(r, settings.delay));
+            const chatContainer = await waitForElement(SELECTORS.CHAT_CONTAINER, 10000);
 
-            // Extract
-            const messages = extractCurrentConversation();
-            if (messages && messages.length > 0) {
-                const { content, ext } = generateContent(messages, currentItem.title);
-                const safeTitle = currentItem.title.replace(/[^a-z0-9\u4e00-\u9fa5]/gi, '_').slice(0, 50);
+            if (!chatContainer) {
+                // Element not found after timeout, record error and continue
                 results.push({
-                    filename: `${safeTitle}_${currentItem.id}.${ext}`,
-                    content: content
+                    filename: `ERROR_${currentItem.id}.txt`,
+                    content: `Failed to load chat container for: ${currentItem.title}`
                 });
             } else {
-                results.push({ filename: `ERROR_${currentItem.id}.txt`, content: "Failed to extract." });
+                await new Promise(r => setTimeout(r, settings.delay));
+
+                // Extract
+                const messages = extractCurrentConversation();
+                if (messages && messages.length > 0) {
+                    const { content, ext } = generateContent(messages, currentItem.title);
+                    const safeTitle = currentItem.title.replace(/[^a-z0-9\u4e00-\u9fa5]/gi, '_').slice(0, 50);
+                    results.push({
+                        filename: `${safeTitle}_${currentItem.id}.${ext}`,
+                        content: content
+                    });
+                } else {
+                    results.push({ filename: `ERROR_${currentItem.id}.txt`, content: "Failed to extract messages." });
+                }
             }
 
             // Update State
@@ -239,11 +255,11 @@
             GM_setValue(STATE_KEYS.QUEUE, queue);
             GM_setValue(STATE_KEYS.RESULTS, results);
 
-            // Loop
-            this.processQueue(updateStatus, updateProgress);
+            // Loop (recursive call with same totalCount)
+            this.processQueue(updateStatus, updateProgress, totalCount);
         },
 
-        finalizeExport(results, updateStatus) {
+        finalizeExport(results, updateStatus, updateProgress) {
             const settings = getSettings();
 
             if (settings.exportMode === 'single') {
@@ -260,6 +276,7 @@
             } else {
                 // ZIP Mode
                 updateStatus('📦 Preparing ZIP...');
+                if (updateProgress) updateProgress(90);
                 const zip = new JSZip();
 
                 results.forEach((f) => {
@@ -269,10 +286,15 @@
                 updateStatus('🗜️ Compressing...');
                 zip.generateAsync(
                     { type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } },
-                    (metadata) => updateStatus(`🗜️ Compressing: ${metadata.percent.toFixed(0)}%`)
+                    (metadata) => {
+                        const compressProgress = 90 + Math.round(metadata.percent / 10); // 90-100%
+                        updateStatus(`🗜️ Compressing: ${metadata.percent.toFixed(0)}%`);
+                        if (updateProgress) updateProgress(compressProgress);
+                    }
                 ).then(function (content) {
                     saveAs(content, `Gemini_Export_Full_${new Date().toISOString().slice(0, 10)}.zip`);
                     updateStatus('✅ Done! Download started.');
+                    if (updateProgress) updateProgress(100);
                     cleanup();
                 });
             }
@@ -340,13 +362,17 @@
 
         // Backdrop
         const backdrop = document.createElement('div');
+        backdrop.id = 'gemini-settings-backdrop';
         Object.assign(backdrop.style, {
             position: 'fixed', top: 0, left: 0, width: '100%', height: '100%',
-            backgroundColor: 'rgba(0,0,0,0.5)', zIndex: '10000'
+            backgroundColor: 'rgba(0,0,0,0.5)', zIndex: '10000', cursor: 'pointer'
         });
         document.body.appendChild(backdrop);
 
         const close = () => { modal.remove(); backdrop.remove(); };
+
+        // Click backdrop to close
+        backdrop.onclick = close;
 
         document.getElementById('gs-cancel').onclick = close;
         document.getElementById('gs-save').onclick = () => {
@@ -357,8 +383,31 @@
                 delay: 2000
             });
             close();
-            alert('Settings saved!');
+            showToast('✅ Settings saved!');
         };
+    }
+
+    // --- UI: Toast Notification ---
+    function showToast(message, duration = 2000) {
+        const toast = document.createElement('div');
+        Object.assign(toast.style, {
+            position: 'fixed', bottom: '20px', left: '50%', transform: 'translateX(-50%)',
+            backgroundColor: '#333', color: 'white', padding: '12px 24px',
+            borderRadius: '8px', boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+            zIndex: '10002', fontFamily: 'sans-serif', fontSize: '14px',
+            opacity: '0', transition: 'opacity 0.3s'
+        });
+        toast.innerText = message;
+        document.body.appendChild(toast);
+
+        // Fade in
+        setTimeout(() => toast.style.opacity = '1', 10);
+
+        // Fade out and remove
+        setTimeout(() => {
+            toast.style.opacity = '0';
+            setTimeout(() => toast.remove(), 300);
+        }, duration);
     }
 
     // --- UI: Progress Overlay (No more side panel) ---
@@ -367,15 +416,41 @@
         overlay.id = 'gemini-exporter-overlay';
         Object.assign(overlay.style, {
             position: 'fixed', top: '20px', right: '20px',
-            backgroundColor: 'rgba(0,0,0,0.8)', color: 'white',
+            backgroundColor: 'rgba(0,0,0,0.9)', color: 'white',
             padding: '15px', borderRadius: '8px', zIndex: '10000',
-            fontFamily: 'monospace', minWidth: '250px'
+            fontFamily: 'monospace', minWidth: '280px'
         });
-        overlay.innerHTML = `<div id="gs-status">Starting...</div><div id="gs-bar" style="width:0%; height:4px; background:#4caf50; margin-top:10px; transition: width 0.3s"></div>`;
+        overlay.innerHTML = `
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <span style="font-weight:bold;">Gemini Exporter</span>
+                <button id="gs-stop" style="background:#e74c3c; color:white; border:none; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:12px;">⏹ Stop</button>
+            </div>
+            <div id="gs-status">Starting...</div>
+            <div id="gs-bar" style="width:0%; height:6px; background:#4caf50; margin-top:10px; border-radius:3px; transition: width 0.3s"></div>
+        `;
         document.body.appendChild(overlay);
+
+        // Stop button handler
+        document.getElementById('gs-stop').onclick = () => {
+            if (confirm('Stop the export process? Progress will be lost.')) {
+                GM_setValue(STATE_KEYS.IS_RUNNING, false);
+                GM_deleteValue(STATE_KEYS.QUEUE);
+                GM_deleteValue(STATE_KEYS.RESULTS);
+                GM_deleteValue('gemini_export_total');
+                overlay.remove();
+                alert('Export cancelled.');
+            }
+        };
+
         return {
-            updateText: (txt) => document.getElementById('gs-status').innerText = txt,
-            updateBar: (pct) => document.getElementById('gs-bar').style.width = pct + '%'
+            updateText: (txt) => {
+                const el = document.getElementById('gs-status');
+                if (el) el.innerText = txt;
+            },
+            updateBar: (pct) => {
+                const el = document.getElementById('gs-bar');
+                if (el) el.style.width = pct + '%';
+            }
         };
     }
 
@@ -403,7 +478,12 @@
         try {
             const links = await BatchExporter.crawlSidebar((msg) => ui.updateText(msg));
             GM_setValue(STATE_KEYS.QUEUE, links);
-            BatchExporter.processQueue((msg) => ui.updateText(msg));
+            GM_setValue('gemini_export_total', links.length); // Store total for resume
+            BatchExporter.processQueue(
+                (msg) => ui.updateText(msg),
+                (pct) => ui.updateBar(pct),
+                links.length
+            );
         } catch (e) {
             ui.updateText('Error: ' + e.message);
             GM_setValue(STATE_KEYS.IS_RUNNING, false);
@@ -419,7 +499,12 @@
     if (GM_getValue(STATE_KEYS.IS_RUNNING, false)) {
         const ui = showProgressOverlay();
         ui.updateText('Resuming batch export...');
-        BatchExporter.processQueue((msg) => ui.updateText(msg));
+        const totalCount = GM_getValue('gemini_export_total', 1); // Retrieve stored total
+        BatchExporter.processQueue(
+            (msg) => ui.updateText(msg),
+            (pct) => ui.updateBar(pct),
+            totalCount
+        );
     }
 
 })();

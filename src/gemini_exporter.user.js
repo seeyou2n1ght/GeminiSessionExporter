@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Session Exporter
 // @namespace    http://tampermonkey.net/
-// @version      0.2
+// @version      0.2.1
 // @description  Export Gemini chat history to Markdown/PDF/ZIP
 // @author       Antigravity
 // @match        https://gemini.google.com/*
@@ -23,7 +23,9 @@
         USER_ROW: 'user-query',
         MODEL_ROW: 'model-response',
         MODEL_CONTENT: '.markdown',
-        SIDEBAR_CONTAINER: 'side-navigation infinite-scroller, nav infinite-scroller',
+        // Updated selector to work with Gemini's latest DOM structure
+        // Priority: role="navigation" (most stable) -> side-navigation-content (new structure) -> legacy selectors (backwards compatibility)
+        SIDEBAR_CONTAINER: '[role="navigation"] infinite-scroller, side-navigation-content infinite-scroller, side-navigation-v2 infinite-scroller, side-navigation infinite-scroller, nav infinite-scroller',
         SIDEBAR_ITEM: 'a.conversation',
         TITLE: 'h1.title, .conversation-title, a.conversation.active .conversation-title'
     };

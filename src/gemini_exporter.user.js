@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Session Exporter
 // @namespace    http://tampermonkey.net/
-// @version      0.3
+// @version      0.4
 // @description  Export Gemini chat history to Markdown/PDF/ZIP
 // @author       Antigravity
 // @match        https://gemini.google.com/*
@@ -24,7 +24,6 @@
         MODEL_ROW: 'model-response',
         MODEL_CONTENT: '.markdown',
         // Updated selector to work with Gemini's latest DOM structure
-        // Priority: role="navigation" (most stable) -> side-navigation-content (new structure) -> legacy selectors (backwards compatibility)
         SIDEBAR_CONTAINER: '[role="navigation"] infinite-scroller, side-navigation-content infinite-scroller, side-navigation-v2 infinite-scroller, side-navigation infinite-scroller, nav infinite-scroller',
         SIDEBAR_ITEM: 'a.conversation',
         TITLE: 'h1.title, .conversation-title, a.conversation.active .conversation-title'
@@ -34,8 +33,24 @@
         QUEUE: 'gemini_export_queue',
         RESULTS: 'gemini_export_results',
         IS_RUNNING: 'gemini_export_running',
-        CURRENT_INDEX: 'gemini_export_index'
+        SETTINGS: 'gemini_export_settings'
     };
+
+    const DEFAULT_SETTINGS = {
+        format: 'markdown', // 'markdown' or 'txt'
+        exportMode: 'zip',  // 'zip' (all in one) or 'single' (individual downloads - not recommended for batch)
+        includeMetadata: true,
+        delay: 2000
+    };
+
+    // --- Helper: Settings Management ---
+    function getSettings() {
+        return { ...DEFAULT_SETTINGS, ...GM_getValue(STATE_KEYS.SETTINGS, {}) };
+    }
+
+    function saveSettings(newSettings) {
+        GM_setValue(STATE_KEYS.SETTINGS, newSettings);
+    }
 
     // --- Helper: retrySelector ---
     function waitForElement(selector, timeout = 5000) {
@@ -65,11 +80,8 @@
 
     // --- Core: Extraction Logic ---
     function getConversationTitle() {
-        // Try to find the title in the header or the active sidebar item
         const activeSidebarItem = document.querySelector('a.conversation[aria-current="page"] .conversation-title');
         if (activeSidebarItem) return activeSidebarItem.innerText.trim();
-
-        // Fallback: Use timestamp
         return `Gemini_Chat_${new Date().toISOString().slice(0, 10)}`;
     }
 
@@ -80,12 +92,7 @@
             return null;
         }
 
-        // Gemini structure: Rows are often generic divs. Inside them are user-query or model-response components.
-        // We iterate through visual order.
         const output = [];
-
-        // Strategy: Query all user-query and model-response elements in document order
-        // This relies on the fact that they appear in chronological order in the DOM
         const allMessages = Array.from(historyContainer.querySelectorAll(`${SELECTORS.USER_ROW}, ${SELECTORS.MODEL_ROW}`));
 
         allMessages.forEach(msg => {
@@ -93,19 +100,15 @@
             let text = '';
 
             if (isUser) {
-                // User query text
                 text = msg.innerText || msg.textContent;
                 text = text.replace(/edit\s*$/i, '').trim();
             } else {
-                // Model response: Use Turndown on the .markdown container if available
-                // We also check for 'message-content' which sometimes wraps the markdown
                 const markdownContainer = msg.querySelector(SELECTORS.MODEL_CONTENT) || msg.querySelector('.message-content') || msg;
                 if (markdownContainer) {
                     const turndownService = new TurndownService({
                         headingStyle: 'atx',
                         codeBlockStyle: 'fenced'
                     });
-                    // Configure Turndown to ignore some Gemini-specific UI artifacts if needed
                     text = turndownService.turndown(markdownContainer.innerHTML);
                 } else {
                     text = msg.innerText;
@@ -123,16 +126,28 @@
         return output;
     }
 
-    function generateMarkdown(messages, title) {
-        let md = `# ${title}\n\n`;
-        md += `> Exported at: ${new Date().toLocaleString()}\n\n`;
+    function generateContent(messages, title) {
+        const settings = getSettings();
 
-        messages.forEach(msg => {
-            md += `## ${msg.role}\n\n`;
-            md += `${msg.content}\n\n`;
-            md += `---\n\n`;
-        });
-        return md;
+        if (settings.format === 'txt') {
+            let txt = `Title: ${title}\n`;
+            if (settings.includeMetadata) txt += `Date: ${new Date().toLocaleString()}\n`;
+            txt += `\n------------------\n\n`;
+            messages.forEach(msg => {
+                txt += `[${msg.role}]\n${msg.content}\n\n`;
+            });
+            return { content: txt, ext: 'txt', type: 'text/plain;charset=utf-8' };
+        } else {
+            // Markdown
+            let md = `# ${title}\n\n`;
+            if (settings.includeMetadata) md += `> Exported at: ${new Date().toLocaleString()}\n\n`;
+            messages.forEach(msg => {
+                md += `## ${msg.role}\n\n`;
+                md += `${msg.content}\n\n`;
+                md += `---\n\n`;
+            });
+            return { content: md, ext: 'md', type: 'text/markdown;charset=utf-8' };
+        }
     }
 
     // --- Batch Export Logic ---
@@ -142,23 +157,22 @@
             const nav = document.querySelector(SELECTORS.SIDEBAR_CONTAINER);
             if (!nav) throw new Error('Sidebar not found');
 
-            updateStatus('📜 Scrolling to find all chats...');
+            updateStatus('📜 Scrolling to find sessions...');
             let previousHeight = 0;
             let noChangeCount = 0;
 
-            // Limit iterations to avoid infinite loops, e.g. 100 scrolls max
             for (let i = 0; i < 100; i++) {
                 nav.scrollTop = nav.scrollHeight;
                 await new Promise(r => setTimeout(r, 1500));
 
                 if (nav.scrollHeight === previousHeight) {
                     noChangeCount++;
-                    if (noChangeCount >= 2) break; // Stop if no growth twice
+                    if (noChangeCount >= 2) break;
                 } else {
                     noChangeCount = 0;
                 }
                 previousHeight = nav.scrollHeight;
-                updateStatus(`📜 Scrolling... (found ${document.querySelectorAll(SELECTORS.SIDEBAR_ITEM).length} items)`);
+                updateStatus(`📜 Scrolling... found ${document.querySelectorAll(SELECTORS.SIDEBAR_ITEM).length} items`);
             }
 
             const links = Array.from(document.querySelectorAll(SELECTORS.SIDEBAR_ITEM)).map(a => ({
@@ -180,262 +194,232 @@
             return unique;
         },
 
-        async processQueue(updateStatus) {
+        async processQueue(updateStatus, updateProgress) {
             const queue = GM_getValue(STATE_KEYS.QUEUE, []);
             let results = GM_getValue(STATE_KEYS.RESULTS, []);
+            const settings = getSettings();
 
-            // If empty queue, we are done
             if (queue.length === 0) {
                 this.finalizeExport(results, updateStatus);
                 return;
             }
 
             const currentItem = queue[0];
-            updateStatus(`⏳ Processing: ${currentItem.title} (${results.length} done, ${queue.length} left)`);
+            updateStatus(`⏳ Processing: ${currentItem.title}`);
 
-            // Navigate
+            // Navigate if needed
             if (window.location.href !== currentItem.url) {
-                // Try SPA navigation override first if possible, else direct assign
-                // Finding the link in sidebar to click is safest for SPA
                 const link = document.querySelector(`a[href*="${currentItem.id}"]`);
                 if (link) {
                     link.click();
                 } else {
                     window.location.href = currentItem.url;
-                    // If hard reload, the script restarts and 'initUI' will verify 'IS_RUNNING' flag logic (to be implemented)
-                    // For now, let's assume we need to wait for load here
                 }
             }
 
             // Wait for content
             await waitForElement(SELECTORS.CHAT_CONTAINER, 10000);
-            await new Promise(r => setTimeout(r, 2000)); // Extra buffer for API
+            await new Promise(r => setTimeout(r, settings.delay));
 
             // Extract
             const messages = extractCurrentConversation();
             if (messages && messages.length > 0) {
-                const md = generateMarkdown(messages, currentItem.title);
-                results.push({ filename: `${currentItem.id}_${currentItem.title.replace(/[^a-z0-9]/gi, '_').slice(0, 50)}.md`, content: md });
+                const { content, ext } = generateContent(messages, currentItem.title);
+                const safeTitle = currentItem.title.replace(/[^a-z0-9\u4e00-\u9fa5]/gi, '_').slice(0, 50);
+                results.push({
+                    filename: `${safeTitle}_${currentItem.id}.${ext}`,
+                    content: content
+                });
             } else {
-                results.push({ filename: `ERROR_${currentItem.id}.txt`, content: "Failed to extract or empty." });
+                results.push({ filename: `ERROR_${currentItem.id}.txt`, content: "Failed to extract." });
             }
 
             // Update State
-            queue.shift(); // Remove done
+            queue.shift();
             GM_setValue(STATE_KEYS.QUEUE, queue);
             GM_setValue(STATE_KEYS.RESULTS, results);
 
             // Loop
-            this.processQueue(updateStatus);
+            this.processQueue(updateStatus, updateProgress);
         },
 
         finalizeExport(results, updateStatus) {
-            updateStatus('📦 Preparing ZIP archive...');
-            const zip = new JSZip();
+            const settings = getSettings();
 
-            // Add files with progress feedback
-            results.forEach((f, index) => {
-                zip.file(f.filename, f.content);
-                if (index % 10 === 0 || index === results.length - 1) {
-                    updateStatus(`📦 Adding files to archive: ${index + 1}/${results.length}`);
-                }
-            });
-
-            updateStatus('🗜️ Compressing archive (this may take a while)...');
-
-            // Use progress callback for compression
-            zip.generateAsync(
-                {
-                    type: "blob",
-                    compression: "DEFLATE",
-                    compressionOptions: { level: 6 } // Balance between speed and size
-                },
-                function updateCallback(metadata) {
-                    // metadata.percent is the progress percentage (0-100)
-                    // metadata.currentFile is the current file being processed
-                    const percent = metadata.percent.toFixed(0);
-                    updateStatus(`🗜️ Compressing: ${percent}% (${metadata.currentFile || 'finalizing...'})`);
-                }
-            ).then(function (content) {
-                saveAs(content, `Gemini_Export_Full_${new Date().toISOString().slice(0, 10)}.zip`);
-                updateStatus('✅ Done! Download started.');
-                // Reset State
-                GM_setValue(STATE_KEYS.IS_RUNNING, false);
-                GM_deleteValue(STATE_KEYS.QUEUE);
-                GM_deleteValue(STATE_KEYS.RESULTS);
-            });
-        }
-    };
-
-    // --- UI: Control Panel ---
-    function createTeleportContainer() {
-        const existing = document.getElementById('gemini-exporter-panel');
-        if (existing) return existing;
-
-        const panel = document.createElement('div');
-        panel.id = 'gemini-exporter-panel';
-        Object.assign(panel.style, {
-            position: 'fixed',
-            bottom: '20px',
-            right: '20px',
-            backgroundColor: '#1e1e1e',
-            color: '#fff',
-            padding: '15px',
-            borderRadius: '8px',
-            boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
-            zIndex: '9999',
-            fontFamily: 'Google Sans, sans-serif',
-            fontSize: '14px',
-            minWidth: '250px',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '8px'
-        });
-
-        const title = document.createElement('h3');
-        title.innerText = 'Gemini Exporter v0.3';
-        title.style.margin = '0 0 5px 0';
-        title.style.fontSize = '16px';
-        title.style.borderBottom = '1px solid #333';
-        title.style.paddingBottom = '5px';
-        panel.appendChild(title);
-
-        const status = document.createElement('div');
-        status.id = 'gemini-export-status';
-        status.innerText = 'Ready';
-        status.style.fontSize = '12px';
-        status.style.color = '#aaa';
-        panel.appendChild(status);
-
-        // Progress Bar Container
-        const progressContainer = document.createElement('div');
-        progressContainer.id = 'gemini-export-progress-container';
-        progressContainer.style.display = 'none'; // Hidden by default
-        progressContainer.style.width = '100%';
-        progressContainer.style.height = '20px';
-        progressContainer.style.backgroundColor = '#333';
-        progressContainer.style.borderRadius = '10px';
-        progressContainer.style.overflow = 'hidden';
-        progressContainer.style.marginTop = '5px';
-
-        const progressBar = document.createElement('div');
-        progressBar.id = 'gemini-export-progress-bar';
-        progressBar.style.width = '0%';
-        progressBar.style.height = '100%';
-        progressBar.style.backgroundColor = '#4caf50';
-        progressBar.style.transition = 'width 0.3s ease';
-        progressBar.style.display = 'flex';
-        progressBar.style.alignItems = 'center';
-        progressBar.style.justifyContent = 'center';
-        progressBar.style.fontSize = '10px';
-        progressBar.style.fontWeight = 'bold';
-
-        progressContainer.appendChild(progressBar);
-        panel.appendChild(progressContainer);
-
-        return { panel, status, progressContainer, progressBar };
-    }
-
-    function addControl(panel, label, onClick) {
-        const btn = document.createElement('button');
-        btn.innerText = label;
-        Object.assign(btn.style, {
-            padding: '8px',
-            backgroundColor: '#4caf50',
-            border: 'none',
-            borderRadius: '4px',
-            color: 'white',
-            cursor: 'pointer',
-            fontWeight: 'bold'
-        });
-        btn.onmouseover = () => btn.style.backgroundColor = '#45a049';
-        btn.onmouseout = () => btn.style.backgroundColor = '#4caf50';
-        btn.onclick = onClick;
-        panel.appendChild(btn);
-        return btn;
-    }
-
-    function initUI() {
-        // Wait for page load
-        setTimeout(() => {
-            const { panel, status, progressContainer, progressBar } = createTeleportContainer();
-
-            // Helper function to update progress
-            const updateProgress = (percent) => {
-                if (percent > 0) {
-                    progressContainer.style.display = 'block';
-                    progressBar.style.width = percent + '%';
-                    progressBar.innerText = percent + '%';
-                } else {
-                    progressContainer.style.display = 'none';
-                }
-            };
-
-            // Resume Check
-            if (GM_getValue(STATE_KEYS.IS_RUNNING, false)) {
-                addControl(panel, '🔴 Stop Export', () => {
-                    GM_setValue(STATE_KEYS.IS_RUNNING, false);
-                    window.location.reload();
+            if (settings.exportMode === 'single') {
+                // Not really recommended for batch, but implemented as requested
+                updateStatus('💾 Saving individual files...');
+                results.forEach((f, i) => {
+                    setTimeout(() => {
+                        const blob = new Blob([f.content], { type: 'text/plain;charset=utf-8' });
+                        saveAs(blob, f.filename);
+                    }, i * 500);
                 });
-                status.innerText = 'Resuming batch export...';
-                BatchExporter.processQueue((msg) => status.innerText = msg);
+                updateStatus('✅ Individual downloads started.');
+                cleanup();
             } else {
-                addControl(panel, '📄 Export Current (MD)', () => {
-                    const title = getConversationTitle();
-                    const messages = extractCurrentConversation();
-                    if (messages && messages.length > 0) {
-                        const mdContent = generateMarkdown(messages, title);
-                        const blob = new Blob([mdContent], { type: 'text/markdown;charset=utf-8' });
-                        saveAs(blob, `${title.replace(/[^a-z0-9]/gi, '_').slice(0, 50)}.md`);
-                        status.innerText = 'Exported current chat.';
-                    } else {
-                        alert('No messages found! Please scroll to load history.');
-                    }
+                // ZIP Mode
+                updateStatus('📦 Preparing ZIP...');
+                const zip = new JSZip();
+
+                results.forEach((f) => {
+                    zip.file(f.filename, f.content);
                 });
 
-                addControl(panel, '📦 Batch Export All (ZIP)', async () => {
-                    if (!confirm('This will scroll your sidebar to find ALL chats, then visit each one to export. It may take a while. Continue?')) return;
-
-                    GM_setValue(STATE_KEYS.IS_RUNNING, true);
-                    GM_setValue(STATE_KEYS.RESULTS, []); // Reset results
-
-                    try {
-                        const links = await BatchExporter.crawlSidebar((msg) => {
-                            status.innerText = msg;
-                            updateProgress(5); // Sidebar discovery: 5%
-                        });
-                        status.innerText = `Found ${links.length} chats. Starting export...`;
-                        updateProgress(10);
-                        GM_setValue(STATE_KEYS.QUEUE, links);
-                        const totalChats = links.length;
-                        BatchExporter.processQueue((msg) => {
-                            status.innerText = msg;
-                            // Extract progress from message (e.g., "Processing 3/25")
-                            const match = msg.match(/(\d+) done, (\d+) left/);
-                            if (match) {
-                                const done = parseInt(match[1]);
-                                const progressPercent = 10 + Math.floor((done / totalChats) * 80); // 10% to 90%
-                                updateProgress(progressPercent);
-                            }
-                            // Check for compression progress
-                            const compressMatch = msg.match(/Compressing: (\d+)%/);
-                            if (compressMatch) {
-                                const percent = 90 + Math.floor(parseInt(compressMatch[1]) / 10); // 90% to 100%
-                                updateProgress(percent);
-                            }
-                        });
-                    } catch (e) {
-                        status.innerText = 'Error: ' + e.message;
-                        GM_setValue(STATE_KEYS.IS_RUNNING, false);
-                    }
+                updateStatus('🗜️ Compressing...');
+                zip.generateAsync(
+                    { type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } },
+                    (metadata) => updateStatus(`🗜️ Compressing: ${metadata.percent.toFixed(0)}%`)
+                ).then(function (content) {
+                    saveAs(content, `Gemini_Export_Full_${new Date().toISOString().slice(0, 10)}.zip`);
+                    updateStatus('✅ Done! Download started.');
+                    cleanup();
                 });
             }
 
-            document.body.appendChild(panel);
-        }, 2000);
+            function cleanup() {
+                GM_setValue(STATE_KEYS.IS_RUNNING, false);
+                GM_deleteValue(STATE_KEYS.QUEUE);
+                GM_deleteValue(STATE_KEYS.RESULTS);
+                setTimeout(() => {
+                    const overlay = document.getElementById('gemini-exporter-overlay');
+                    if (overlay) overlay.remove();
+                }, 3000);
+            }
+        }
+    };
+
+    // --- UI: Settings Modal ---
+    function showSettingsModal() {
+        if (document.getElementById('gemini-settings-modal')) return;
+
+        const current = getSettings();
+
+        const modal = document.createElement('div');
+        modal.id = 'gemini-settings-modal';
+        Object.assign(modal.style, {
+            position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+            backgroundColor: '#1e1e1e', color: '#fff', padding: '20px', borderRadius: '8px',
+            boxShadow: '0 0 20px rgba(0,0,0,0.8)', zIndex: '10001',
+            minWidth: '300px', fontFamily: 'sans-serif'
+        });
+
+        let html = `<h2 style="margin-top:0">Export Settings</h2>`;
+
+        // Format
+        html += `<div style="margin-bottom:15px">
+            <label>Format:</label><br>
+            <select id="gs-format" style="width:100%; padding:5px; margin-top:5px; background:#333; color:#fff; border:1px solid #555">
+                <option value="markdown" ${current.format === 'markdown' ? 'selected' : ''}>Markdown (.md)</option>
+                <option value="txt" ${current.format === 'txt' ? 'selected' : ''}>Plain Text (.txt)</option>
+            </select>
+        </div>`;
+
+        // Export Mode
+        html += `<div style="margin-bottom:15px">
+            <label>Save Mode (Batch):</label><br>
+            <select id="gs-mode" style="width:100%; padding:5px; margin-top:5px; background:#333; color:#fff; border:1px solid #555">
+                <option value="zip" ${current.exportMode === 'zip' ? 'selected' : ''}>Single ZIP Archive (Recommended)</option>
+                <option value="single" ${current.exportMode === 'single' ? 'selected' : ''}>Individual Files (Might prompt)</option>
+            </select>
+        </div>`;
+
+        // Metadata
+        html += `<div style="margin-bottom:15px">
+            <label><input type="checkbox" id="gs-meta" ${current.includeMetadata ? 'checked' : ''}> Include Metadata (Date/Time)</label>
+        </div>`;
+
+        // Buttons
+        html += `<div style="text-align:right; margin-top:20px">
+            <button id="gs-cancel" style="margin-right:10px; padding:5px 10px; cursor:pointer">Cancel</button>
+            <button id="gs-save" style="padding:5px 15px; background:#4caf50; color:white; border:none; border-radius:4px; cursor:pointer">Save</button>
+        </div>`;
+
+        modal.innerHTML = html;
+        document.body.appendChild(modal);
+
+        // Backdrop
+        const backdrop = document.createElement('div');
+        Object.assign(backdrop.style, {
+            position: 'fixed', top: 0, left: 0, width: '100%', height: '100%',
+            backgroundColor: 'rgba(0,0,0,0.5)', zIndex: '10000'
+        });
+        document.body.appendChild(backdrop);
+
+        const close = () => { modal.remove(); backdrop.remove(); };
+
+        document.getElementById('gs-cancel').onclick = close;
+        document.getElementById('gs-save').onclick = () => {
+            saveSettings({
+                format: document.getElementById('gs-format').value,
+                exportMode: document.getElementById('gs-mode').value,
+                includeMetadata: document.getElementById('gs-meta').checked,
+                delay: 2000
+            });
+            close();
+            alert('Settings saved!');
+        };
     }
 
-    // --- Boot ---
-    initUI();
+    // --- UI: Progress Overlay (No more side panel) ---
+    function showProgressOverlay() {
+        const overlay = document.createElement('div');
+        overlay.id = 'gemini-exporter-overlay';
+        Object.assign(overlay.style, {
+            position: 'fixed', top: '20px', right: '20px',
+            backgroundColor: 'rgba(0,0,0,0.8)', color: 'white',
+            padding: '15px', borderRadius: '8px', zIndex: '10000',
+            fontFamily: 'monospace', minWidth: '250px'
+        });
+        overlay.innerHTML = `<div id="gs-status">Starting...</div><div id="gs-bar" style="width:0%; height:4px; background:#4caf50; margin-top:10px; transition: width 0.3s"></div>`;
+        document.body.appendChild(overlay);
+        return {
+            updateText: (txt) => document.getElementById('gs-status').innerText = txt,
+            updateBar: (pct) => document.getElementById('gs-bar').style.width = pct + '%'
+        };
+    }
+
+    // --- Menu Commands ---
+    function runExportCurrent() {
+        const title = getConversationTitle();
+        const messages = extractCurrentConversation();
+        if (messages && messages.length > 0) {
+            const { content, ext, type } = generateContent(messages, title);
+            const blob = new Blob([content], { type: type });
+            saveAs(blob, `${title.replace(/[^a-z0-9]/gi, '_')}.${ext}`);
+        } else {
+            alert('No messages found!');
+        }
+    }
+
+    async function runBatchExport() {
+        if (!confirm('Start batch export of ALL sessions?')) return;
+
+        GM_setValue(STATE_KEYS.IS_RUNNING, true);
+        GM_setValue(STATE_KEYS.RESULTS, []);
+
+        const ui = showProgressOverlay();
+
+        try {
+            const links = await BatchExporter.crawlSidebar((msg) => ui.updateText(msg));
+            GM_setValue(STATE_KEYS.QUEUE, links);
+            BatchExporter.processQueue((msg) => ui.updateText(msg));
+        } catch (e) {
+            ui.updateText('Error: ' + e.message);
+            GM_setValue(STATE_KEYS.IS_RUNNING, false);
+        }
+    }
+
+    // --- Init ---
+    GM_registerMenuCommand("📄 Export Current Session", runExportCurrent);
+    GM_registerMenuCommand("📦 Batch Export All", runBatchExport);
+    GM_registerMenuCommand("⚙️ Settings", showSettingsModal);
+
+    // Resume Logic
+    if (GM_getValue(STATE_KEYS.IS_RUNNING, false)) {
+        const ui = showProgressOverlay();
+        ui.updateText('Resuming batch export...');
+        BatchExporter.processQueue((msg) => ui.updateText(msg));
+    }
 
 })();

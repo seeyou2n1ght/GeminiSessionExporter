@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Session Exporter
 // @namespace    http://tampermonkey.net/
-// @version      0.2.1
+// @version      0.3
 // @description  Export Gemini chat history to Markdown/PDF/ZIP
 // @author       Antigravity
 // @match        https://gemini.google.com/*
@@ -230,13 +230,33 @@
         },
 
         finalizeExport(results, updateStatus) {
-            updateStatus('📦 Zipping files...');
+            updateStatus('📦 Preparing ZIP archive...');
             const zip = new JSZip();
-            results.forEach(f => {
+
+            // Add files with progress feedback
+            results.forEach((f, index) => {
                 zip.file(f.filename, f.content);
+                if (index % 10 === 0 || index === results.length - 1) {
+                    updateStatus(`📦 Adding files to archive: ${index + 1}/${results.length}`);
+                }
             });
 
-            zip.generateAsync({ type: "blob" }).then(function (content) {
+            updateStatus('🗜️ Compressing archive (this may take a while)...');
+
+            // Use progress callback for compression
+            zip.generateAsync(
+                {
+                    type: "blob",
+                    compression: "DEFLATE",
+                    compressionOptions: { level: 6 } // Balance between speed and size
+                },
+                function updateCallback(metadata) {
+                    // metadata.percent is the progress percentage (0-100)
+                    // metadata.currentFile is the current file being processed
+                    const percent = metadata.percent.toFixed(0);
+                    updateStatus(`🗜️ Compressing: ${percent}% (${metadata.currentFile || 'finalizing...'})`);
+                }
+            ).then(function (content) {
                 saveAs(content, `Gemini_Export_Full_${new Date().toISOString().slice(0, 10)}.zip`);
                 updateStatus('✅ Done! Download started.');
                 // Reset State
@@ -273,7 +293,7 @@
         });
 
         const title = document.createElement('h3');
-        title.innerText = 'Gemini Exporter v0.2';
+        title.innerText = 'Gemini Exporter v0.3';
         title.style.margin = '0 0 5px 0';
         title.style.fontSize = '16px';
         title.style.borderBottom = '1px solid #333';
@@ -287,7 +307,33 @@
         status.style.color = '#aaa';
         panel.appendChild(status);
 
-        return { panel, status };
+        // Progress Bar Container
+        const progressContainer = document.createElement('div');
+        progressContainer.id = 'gemini-export-progress-container';
+        progressContainer.style.display = 'none'; // Hidden by default
+        progressContainer.style.width = '100%';
+        progressContainer.style.height = '20px';
+        progressContainer.style.backgroundColor = '#333';
+        progressContainer.style.borderRadius = '10px';
+        progressContainer.style.overflow = 'hidden';
+        progressContainer.style.marginTop = '5px';
+
+        const progressBar = document.createElement('div');
+        progressBar.id = 'gemini-export-progress-bar';
+        progressBar.style.width = '0%';
+        progressBar.style.height = '100%';
+        progressBar.style.backgroundColor = '#4caf50';
+        progressBar.style.transition = 'width 0.3s ease';
+        progressBar.style.display = 'flex';
+        progressBar.style.alignItems = 'center';
+        progressBar.style.justifyContent = 'center';
+        progressBar.style.fontSize = '10px';
+        progressBar.style.fontWeight = 'bold';
+
+        progressContainer.appendChild(progressBar);
+        panel.appendChild(progressContainer);
+
+        return { panel, status, progressContainer, progressBar };
     }
 
     function addControl(panel, label, onClick) {
@@ -312,7 +358,18 @@
     function initUI() {
         // Wait for page load
         setTimeout(() => {
-            const { panel, status } = createTeleportContainer();
+            const { panel, status, progressContainer, progressBar } = createTeleportContainer();
+
+            // Helper function to update progress
+            const updateProgress = (percent) => {
+                if (percent > 0) {
+                    progressContainer.style.display = 'block';
+                    progressBar.style.width = percent + '%';
+                    progressBar.innerText = percent + '%';
+                } else {
+                    progressContainer.style.display = 'none';
+                }
+            };
 
             // Resume Check
             if (GM_getValue(STATE_KEYS.IS_RUNNING, false)) {
@@ -343,10 +400,30 @@
                     GM_setValue(STATE_KEYS.RESULTS, []); // Reset results
 
                     try {
-                        const links = await BatchExporter.crawlSidebar((msg) => status.innerText = msg);
+                        const links = await BatchExporter.crawlSidebar((msg) => {
+                            status.innerText = msg;
+                            updateProgress(5); // Sidebar discovery: 5%
+                        });
                         status.innerText = `Found ${links.length} chats. Starting export...`;
+                        updateProgress(10);
                         GM_setValue(STATE_KEYS.QUEUE, links);
-                        BatchExporter.processQueue((msg) => status.innerText = msg);
+                        const totalChats = links.length;
+                        BatchExporter.processQueue((msg) => {
+                            status.innerText = msg;
+                            // Extract progress from message (e.g., "Processing 3/25")
+                            const match = msg.match(/(\d+) done, (\d+) left/);
+                            if (match) {
+                                const done = parseInt(match[1]);
+                                const progressPercent = 10 + Math.floor((done / totalChats) * 80); // 10% to 90%
+                                updateProgress(progressPercent);
+                            }
+                            // Check for compression progress
+                            const compressMatch = msg.match(/Compressing: (\d+)%/);
+                            if (compressMatch) {
+                                const percent = 90 + Math.floor(parseInt(compressMatch[1]) / 10); // 90% to 100%
+                                updateProgress(percent);
+                            }
+                        });
                     } catch (e) {
                         status.innerText = 'Error: ' + e.message;
                         GM_setValue(STATE_KEYS.IS_RUNNING, false);

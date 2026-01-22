@@ -67,10 +67,41 @@ async function crawlSidebar() {
     *   `codeBlockStyle: 'fenced'` (``` 风格代码块)
 *   脚本会尝试定位 `.markdown` 容器，直接转换渲染好的 HTML，从而完美保留**粗体**、*斜体*、`代码`、表格等格式，比直接提取 `innerText` 效果好得多。
 
-### 2.4 ZIP 打包与内存管理
+### 2.4 ZIP 打包与进度反馈 (v0.3 优化)
 *   **库**: `JSZip`
 *   **策略**: 将所有 Markdown 字符串保留在 `GM_storage` 或内存中。当队列处理完毕后，一次性生成 ZIP Blob。
-*   **限制**: 如果历史记录极其庞大（如几百兆文本），可能会触碰到浏览器的内存或 Storage Quota 限制。目前的 v0.2 版本适用于普通用户（< 10MB 文本数据）。
+*   **进度回调** (v0.3 新增):
+    *   JSZip 的 `generateAsync` 方法支持第二个参数 `onUpdate`，它会在压缩过程中被周期性调用。
+    *   回调函数接收 `metadata` 对象，包含：
+        *   `percent`: 压缩进度百分比 (0-100)
+        *   `currentFile`: 当前正在处理的文件名
+    *   脚本利用这个回调实时更新 UI 状态文本和进度条。
+    
+#### 进度条实现
+```javascript
+// UI 组件
+const progressBar = document.createElement('div');
+progressBar.style.width = '0%'; // 初始化为 0%
+progressBar.style.transition = 'width 0.3s ease'; // 平滑动画
+
+// 在压缩时更新
+zip.generateAsync(
+    { type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } },
+    function(metadata) {
+        const percent = metadata.percent.toFixed(0);
+        progressBar.style.width = percent + '%';
+        progressBar.innerText = percent + '%';
+    }
+);
+```
+
+#### 分阶段进度映射
+*   **0-5%**: 侧边栏滚动和会话发现
+*   **5-10%**: 会话列表解析完成
+*   **10-90%**: 逐个提取会话内容（根据 `done/total` 动态计算）
+*   **90-100%**: ZIP 压缩阶段（基于 JSZip 的 `metadata.percent`）
+
+*   **限制**: 如果历史记录极其庞大（如几百兆文本），可能会触碰到浏览器的内存或 Storage Quota 限制。目前的 v0.3 版本适用于普通用户（< 10MB 文本数据）。
 
 ## 3. 防风控与安全性 (Safety & Anti-Blocking)
 
